@@ -110,6 +110,23 @@ parser.add_argument('--val-split', metavar='NAME', default='validation',
                     help='dataset validation split (default: validation)')
 parser.add_argument('--pretrained', action='store_true', default=False,
                     help='Start with pretrained version of specified network (if avail)')
+# --- EIP wta_rev spike regularization (tools/wta_rev.py) ---
+parser.add_argument('--reg-lambda', type=float, default=0.0,
+                    help='wta_rev spike regularization strength (0 = off)')
+parser.add_argument('--reg-alpha', type=float, default=7.0,
+                    help='wta_rev softmax temperature (TF reg_spike_out_alpha)')
+parser.add_argument('--arch', default='QKFormer', type=str,
+                    help='QKFormer | spiking_vgg16 (CNN 대조군)')
+parser.add_argument('--reg-loss-ratio', type=float, default=0.0,
+                    help='loss-ratio control: lambda를 매 epoch reg/task 비율이 이 값이 되도록 조정 (0=off)')
+parser.add_argument('--reg-loss-ratio-start-ep', type=int, default=0,
+                    help='loss-ratio control 시작 epoch (그 전에는 lambda=0)')
+parser.add_argument('--reg-loss-ratio-max', type=float, default=1e-4,
+                    help='loss-ratio control: lambda 상한 (안전장치)')
+parser.add_argument('--reg-mode', default='wta_rev', type=str,
+                    help='wta_rev | l2 (비교군: 표준 L2)')
+parser.add_argument('--reg-track', action='store_true', default=False,
+                    help='attach hooks to log spikes/epoch even when lambda=0 (baseline trajectory)')
 parser.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
                     help='Initialize model from this checkpoint (default: none)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -372,8 +389,15 @@ def main():
 
     import model
 
-    model = create_model(
-        "QKFormer",
+    if getattr(args, 'arch', 'QKFormer') == 'spiking_vgg16':
+        import sys as _s, os as _o
+        _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))
+        from tools import spiking_vgg_cifar  # noqa: F401  (@register_model 등록)
+        model = create_model('spiking_vgg16', pretrained=False,
+                             num_classes=args.num_classes, T=args.time_step)
+    else:
+        model = create_model(
+        args.arch,
         pretrained=False,
         drop_rate=0.,
         drop_path_rate=0.2,
@@ -389,6 +413,22 @@ def main():
     print("Creating model")
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"number of params: {n_parameters}")
+
+    # --- EIP wta_rev 규제 ---
+    spike_reg = None
+    if (getattr(args, 'reg_lambda', 0.0) > 0.0 or getattr(args, 'reg_track', False)
+            or getattr(args, 'reg_loss_ratio', 0.0) > 0.0):
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        from tools.wta_rev import WTARevRegularizer
+        spike_reg = WTARevRegularizer(model, lam=args.reg_lambda, alpha=args.reg_alpha,
+                                      mode=getattr(args, 'reg_mode', 'wta_rev'),
+                                      always_raw=getattr(args, 'reg_loss_ratio', 0.0) > 0.0)
+        _lr = getattr(args, 'reg_loss_ratio', 0.0)
+        print(f"[{spike_reg.mode}] lambda={args.reg_lambda:g}"
+              + (f" loss_ratio_target={_lr:g}" if _lr > 0 else "")
+              + f" alpha={args.reg_alpha:g} "
+              f"layers={len(spike_reg.layers)}")
 
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
@@ -618,14 +658,31 @@ def main():
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
-                amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
+                amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn,
+                spike_reg=spike_reg)
+
+            # --- loss-ratio control: reg/task 비율이 target이 되도록 lambda 재설정 ---
+            # 고정 lambda는 task loss가 떨어지면서 상대 압력이 커진다(실측 3.2배).
+            # 비율을 고정하면 그 드리프트가 사라진다. TF proc.py의 동일 로직.
+            if spike_reg is not None and getattr(args, 'reg_loss_ratio', 0.0) > 0.0:
+                R = train_metrics.get('reg_raw', 0.0)
+                task = train_metrics.get('task_loss', 0.0)
+                if epoch < args.reg_loss_ratio_start_ep or R <= 0.0 or task <= 0.0:
+                    spike_reg.lam = 0.0
+                else:
+                    spike_reg.lam = min(args.reg_loss_ratio * task / R,
+                                        args.reg_loss_ratio_max)
+                train_metrics['adp_lambda'] = spike_reg.lam
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.local_rank == 0:
                     _logger.info("Distributing BatchNorm running means and vars")
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+            if spike_reg is not None:
+                spike_reg.reset_spike_stats()
+            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,
+                                    spike_reg=spike_reg)
 
             if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -659,7 +716,7 @@ def main():
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
-        loss_scaler=None, model_ema=None, mixup_fn=None):
+        loss_scaler=None, model_ema=None, mixup_fn=None, spike_reg=None):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
             loader.mixup_enabled = False
@@ -670,6 +727,10 @@ def train_one_epoch(
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
+    if spike_reg is not None:
+        spike_reg.reset_spike_stats()
+    reg_raw_m = AverageMeter()      # lambda 적용 전 규제값
+    task_loss_m = AverageMeter()    # 규제 제외 task loss
 
     model.train()
 
@@ -689,6 +750,12 @@ def train_one_epoch(
         with amp_autocast():
             output = model(input)
             loss = loss_fn(output, target)
+
+        # --- EIP wta_rev: 규제 손실을 task loss에 더한다 ---
+        if spike_reg is not None:
+            task_loss_m.update(loss.item(), input.size(0))
+            loss = loss + spike_reg.loss()
+            reg_raw_m.update(spike_reg.raw_loss(), input.size(0))
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -710,6 +777,8 @@ def train_one_epoch(
             optimizer.step()
 
         functional.reset_net(model)
+        if spike_reg is not None:
+            spike_reg.reset()
 
         if model_ema is not None:
             model_ema.update(model)
@@ -763,10 +832,15 @@ def train_one_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
+    if spike_reg is not None:
+        return OrderedDict([('loss', losses_m.avg),
+                            ('task_loss', task_loss_m.avg),
+                            ('reg_raw', reg_raw_m.avg),
+                            ('spikes', spike_reg.spikes_per_sample())])
     return OrderedDict([('loss', losses_m.avg)])
 
 
-def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
+def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='', spike_reg=None):
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
@@ -798,6 +872,8 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
             loss = loss_fn(output, target)
             functional.reset_net(model)
+            if spike_reg is not None:
+                spike_reg.reset()
 
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
@@ -828,6 +904,10 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                         loss=losses_m, top1=top1_m, top5=top5_m))
 
     metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+    if spike_reg is not None:
+        # eval 모드 + test set. TF의 s_count(postproc_snn, test_ds_num)와 같은 프로토콜이다.
+        # train 모드/train set 값과는 증강·BN 때문에 다르므로 CNN과 비교할 때는 이쪽을 쓴다.
+        metrics['spikes'] = spike_reg.spikes_per_sample()
 
     return metrics
 
